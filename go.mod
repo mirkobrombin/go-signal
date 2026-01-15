@@ -4,6 +4,4 @@ go 1.24.0
 
 toolchain go1.24.4
 
-replace github.com/mirkobrombin/go-foundation => ../go-foundation
-
-require github.com/mirkobrombin/go-foundation v0.2.0 // indirect
+require github.com/mirkobrombin/go-foundation v0.2.1
