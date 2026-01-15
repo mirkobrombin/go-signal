@@ -5,7 +5,9 @@ import (
 	"errors"
 	"reflect"
 	"sort"
-	"sync"
+
+	"github.com/mirkobrombin/go-foundation/pkg/options"
+	"github.com/mirkobrombin/go-foundation/pkg/safemap"
 )
 
 // Handler defines the function signature for event listeners.
@@ -30,8 +32,7 @@ const (
 
 // Bus is a type-safe event bus.
 type Bus struct {
-	subscribers map[reflect.Type][]subscriber
-	mu          sync.RWMutex
+	subscribers *safemap.Map[reflect.Type, []subscriber]
 	strategy    DispatchStrategy
 }
 
@@ -47,20 +48,18 @@ func Default() *Bus {
 	return defaultBus
 }
 
+// Option defines a functional configuration for the Bus.
+type Option = options.Option[Bus]
+
 // New creates a new Bus instance.
 func New(opts ...Option) *Bus {
 	b := &Bus{
-		subscribers: make(map[reflect.Type][]subscriber),
+		subscribers: safemap.New[reflect.Type, []subscriber](),
 		strategy:    StopOnFirstError,
 	}
-	for _, opt := range opts {
-		opt(b)
-	}
+	options.Apply(b, opts...)
 	return b
 }
-
-// Option defines a functional configuration for the Bus.
-type Option func(*Bus)
 
 // WithStrategy sets the dispatch strategy for the bus.
 func WithStrategy(s DispatchStrategy) Option {
@@ -81,16 +80,15 @@ func Subscribe[T any](b *Bus, fn Handler[T], priority ...Priority) {
 
 	key := reflect.TypeFor[T]()
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.subscribers[key] = append(b.subscribers[key], subscriber{
-		handler:  fn,
-		priority: p,
-	})
-
-	sort.SliceStable(b.subscribers[key], func(i, j int) bool {
-		return b.subscribers[key][i].priority > b.subscribers[key][j].priority
+	b.subscribers.Compute(key, func(subs []subscriber, exists bool) []subscriber {
+		newSubs := append(subs, subscriber{
+			handler:  fn,
+			priority: p,
+		})
+		sort.SliceStable(newSubs, func(i, j int) bool {
+			return newSubs[i].priority > newSubs[j].priority
+		})
+		return newSubs
 	})
 }
 
@@ -105,10 +103,7 @@ func Emit[T any](ctx context.Context, b *Bus, event T) error {
 	// which works even if T is an interface{} (any).
 	key := reflect.TypeOf(event)
 
-	b.mu.RLock()
-	subs, ok := b.subscribers[key]
-	b.mu.RUnlock()
-
+	subs, ok := b.subscribers.Get(key)
 	if !ok {
 		return nil
 	}
