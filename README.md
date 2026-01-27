@@ -5,7 +5,7 @@ It leverages Go generics to provide a zero-boilerplate publish/subscribe mechani
 
 ## Features
 
-*   **Type Safe**: Events are typed structs. No `interface{}` casting or magic strings needed.
+*   **Type Safe**: Events are typed structs. No `any` casting or magic strings needed.
 *   **Generics Based**: `Subscribe[UserCreated](...)` automatically infers the event type.
 *   **Prioritized Listeners**: Control execution order with `PriorityHigh`, `PriorityNormal`, `PriorityLow`.
 *   **Middleware Support**: Add logging, tracing, or error handling to the bus pipeline.

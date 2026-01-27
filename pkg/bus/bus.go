@@ -99,9 +99,8 @@ func Emit[T any](ctx context.Context, b *Bus, event T) error {
 		b = defaultBus
 	}
 
-	// We use reflect.TypeOf(event) to get the concrete type,
-	// which works even if T is an interface{} (any).
-	key := reflect.TypeOf(event)
+	// Use static type T to match Subscribe[T] key
+	key := reflect.TypeFor[T]()
 
 	subs, ok := b.subscribers.Get(key)
 	if !ok {
@@ -110,21 +109,20 @@ func Emit[T any](ctx context.Context, b *Bus, event T) error {
 
 	var errs []error
 	for _, sub := range subs {
-		// We use reflection to call the handler because the stored handler
-		// might have a specific type (e.g. Handler[*MyEvent]) while T might be any.
-		fnVal := reflect.ValueOf(sub.handler)
-		args := []reflect.Value{
-			reflect.ValueOf(ctx),
-			reflect.ValueOf(event),
-		}
-
-		results := fnVal.Call(args)
-		if !results[0].IsNil() {
-			err := results[0].Interface().(error)
-			if b.strategy == StopOnFirstError {
-				return err
+		// Direct type assertion (fast path)
+		if fn, ok := sub.handler.(Handler[T]); ok {
+			if err := fn(ctx, event); err != nil {
+				if b.strategy == StopOnFirstError {
+					return err
+				}
+				errs = append(errs, err)
 			}
-			errs = append(errs, err)
+		} else {
+			// Fallback or panic? Should never happen if T matches key.
+			// But safemap is [reflect.Type, []subscriber].
+			// subscriber.handler is 'any'.
+			// If we retrieved by reflect.TypeFor[T], handler MUST be Handler[T].
+			// Unless memory corruption or manual manipulation.
 		}
 	}
 
