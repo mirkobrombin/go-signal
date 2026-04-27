@@ -5,15 +5,14 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"sync"
 
 	"github.com/mirkobrombin/go-foundation/pkg/options"
 	"github.com/mirkobrombin/go-foundation/pkg/safemap"
 )
 
-// Handler defines the function signature for event listeners.
 type Handler[T any] func(ctx context.Context, event T) error
 
-// Priority defines the order of execution for listeners.
 type Priority int
 
 const (
@@ -22,7 +21,6 @@ const (
 	PriorityLow    Priority = -100
 )
 
-// DispatchStrategy defines how the bus handles multiple listeners.
 type DispatchStrategy int
 
 const (
@@ -30,28 +28,30 @@ const (
 	BestEffort
 )
 
-// Bus is a type-safe event bus.
+type Middleware func(ctx context.Context, event any, next func(ctx context.Context, event any) error) error
+
 type Bus struct {
-	subscribers *safemap.Map[reflect.Type, []subscriber]
-	strategy    DispatchStrategy
+	subscribers  *safemap.Map[reflect.Type, []subscriber]
+	strategy     DispatchStrategy
+	middlewares  []Middleware
+	onAsyncError func(error)
+	wildcard     []subscriber
+	mu           sync.RWMutex
 }
 
 type subscriber struct {
-	handler  any // Wrapped Handler[T]
+	handler  any
 	priority Priority
 }
 
 var defaultBus = New()
 
-// Default returns the package-level default bus.
 func Default() *Bus {
 	return defaultBus
 }
 
-// Option defines a functional configuration for the Bus.
 type Option = options.Option[Bus]
 
-// New creates a new Bus instance.
 func New(opts ...Option) *Bus {
 	b := &Bus{
 		subscribers: safemap.New[reflect.Type, []subscriber](),
@@ -61,30 +61,31 @@ func New(opts ...Option) *Bus {
 	return b
 }
 
-// WithStrategy sets the dispatch strategy for the bus.
 func WithStrategy(s DispatchStrategy) Option {
 	return func(b *Bus) { b.strategy = s }
 }
 
-// Subscribe registers a listener for a specific event type.
-// If b is nil, it uses the default global bus.
+func WithOnAsyncError(fn func(error)) Option {
+	return func(b *Bus) { b.onAsyncError = fn }
+}
+
+func (b *Bus) Use(mw Middleware) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.middlewares = append(b.middlewares, mw)
+}
+
 func Subscribe[T any](b *Bus, fn Handler[T], priority ...Priority) {
 	if b == nil {
 		b = defaultBus
 	}
-
 	p := PriorityNormal
 	if len(priority) > 0 {
 		p = priority[0]
 	}
-
 	key := reflect.TypeFor[T]()
-
 	b.subscribers.Compute(key, func(subs []subscriber, exists bool) []subscriber {
-		newSubs := append(subs, subscriber{
-			handler:  fn,
-			priority: p,
-		})
+		newSubs := append(subs, subscriber{handler: fn, priority: p})
 		sort.SliceStable(newSubs, func(i, j int) bool {
 			return newSubs[i].priority > newSubs[j].priority
 		})
@@ -92,54 +93,94 @@ func Subscribe[T any](b *Bus, fn Handler[T], priority ...Priority) {
 	})
 }
 
-// Emit dispatches an event to all registered listeners synchronously.
-// If b is nil, it uses the default global bus.
+func SubscribeWildcard(b *Bus, fn func(ctx context.Context, event any) error) {
+	if b == nil {
+		b = defaultBus
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.wildcard = append(b.wildcard, subscriber{handler: fn})
+}
+
 func Emit[T any](ctx context.Context, b *Bus, event T) error {
 	if b == nil {
 		b = defaultBus
 	}
-
-	// Use static type T to match Subscribe[T] key
 	key := reflect.TypeFor[T]()
-
 	subs, ok := b.subscribers.Get(key)
-	if !ok {
+
+	b.mu.RLock()
+	mws := b.middlewares
+	b.mu.RUnlock()
+
+	emit := func(ctx context.Context, evt any) error {
+		if !ok {
+			return nil
+		}
+		var errs []error
+		for _, sub := range subs {
+			if fn, ok := sub.handler.(Handler[T]); ok {
+				if err := fn(ctx, evt.(T)); err != nil {
+					if b.strategy == StopOnFirstError {
+						return err
+					}
+					errs = append(errs, err)
+				}
+			}
+		}
+		if len(errs) > 0 {
+			return errors.Join(errs...)
+		}
 		return nil
 	}
 
-	var errs []error
-	for _, sub := range subs {
-		// Direct type assertion (fast path)
-		if fn, ok := sub.handler.(Handler[T]); ok {
-			if err := fn(ctx, event); err != nil {
-				if b.strategy == StopOnFirstError {
-					return err
-				}
-				errs = append(errs, err)
-			}
-		} else {
-			// Fallback or panic? Should never happen if T matches key.
-			// But safemap is [reflect.Type, []subscriber].
-			// subscriber.handler is 'any'.
-			// If we retrieved by reflect.TypeFor[T], handler MUST be Handler[T].
-			// Unless memory corruption or manual manipulation.
-		}
+	if len(mws) > 0 {
+		chain := applyMiddleware(emit, mws)
+		return chain(ctx, event)
 	}
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	if err := emit(ctx, event); err != nil {
+		return err
+	}
+
+	b.mu.RLock()
+	wildcards := b.wildcard
+	b.mu.RUnlock()
+	for _, w := range wildcards {
+		if fn, ok := w.handler.(func(ctx context.Context, event any) error); ok {
+			if err := fn(ctx, event); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
 }
 
-// EmitAsync dispatches an event to listeners in a separate goroutine.
-// If b is nil, it uses the default global bus.
 func EmitAsync[T any](ctx context.Context, b *Bus, event T) {
 	if b == nil {
 		b = defaultBus
 	}
 	go func() {
-		_ = Emit(ctx, b, event)
+		if err := Emit(ctx, b, event); err != nil {
+			b.mu.RLock()
+			fn := b.onAsyncError
+			b.mu.RUnlock()
+			if fn != nil {
+				fn(err)
+			}
+		}
 	}()
 }
+
+func applyMiddleware(handler func(ctx context.Context, evt any) error, middlewares []Middleware) func(ctx context.Context, evt any) error {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		mw := middlewares[i]
+		next := handler
+		handler = func(ctx context.Context, evt any) error {
+			return mw(ctx, evt, next)
+		}
+	}
+	return handler
+}
+
