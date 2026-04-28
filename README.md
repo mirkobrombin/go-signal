@@ -1,5 +1,8 @@
 # Go Signal
 
+> [!CAUTION]
+> go-signal is now part of the [go-foundation](https://github.com/mirkobrombin/go-foundation) framework. The v1.0.0 release mirrors go-signal v2.0.0, but future versions may introduce breaking changes. Please migrate your project.
+
 **Go Signal** is a high-performance, type-safe in-memory event bus for Go.
 It leverages Go generics to provide a zero-boilerplate publish/subscribe mechanism within a single application process.
 
